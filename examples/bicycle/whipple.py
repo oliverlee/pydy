@@ -23,6 +23,8 @@ from pydy.codegen.ode_function_generators import CythonODEFunctionGenerator
 # TODO : Make dtk optional.
 from dtk import bicycle
 
+np.seterr(over='warn', under='warn')
+
 ##################
 # Reference Frames
 ##################
@@ -79,10 +81,6 @@ t = mec.dynamicsymbols._t
 # q6: front wheel rotation angle
 # q7: steering rotation angle
 # q8: rear wheel rotation angle
-# q9: perpendicular distance from the n2> axis to the front contact
-#     point in the ground plane
-# q10: perpendicular distance from the n1> axis to the front contact
-#     point in the ground plane
 
 print('Defining time varying symbols.')
 
@@ -168,9 +166,13 @@ print('Defining position vectors.')
 # newtonian origin
 no = mec.Point('no')
 
-# newtonian origin to rear wheel center
+# rear wheel contact in newtonian frame
+nd = mec.Point('nd')
+nd.set_pos(no, q1*N['1'] + q2*N['2'])
+
+# rear wheel contact in newtonian frame to rear wheel center
 do = mec.Point('do')
-do.set_pos(no, -rr * B['3'])
+do.set_pos(nd, -rr * B['3'])
 
 # rear wheel center to bicycle frame center
 co = mec.Point('co')
@@ -242,16 +244,21 @@ print('Defining linear velocities.')
 # origin is fixed
 no.set_vel(N, 0.0 * N['1'])
 
+# rear wheel contact point in newtonian frame
+u1 = -rr * u6 * sm.cos(q3)
+u2 = -rr * u6 * sm.sin(q3)
+nd.set_vel(N, u1*N['1'] + u2*N['2'])
+
 # mass centers
 #do.set_vel(N, do.pos_from(no).dt(N))
-do.v2pt_theory(no, N, D)
+do.v2pt_theory(nd, N, B)
 co.v2pt_theory(do, N, C)
 ce.v2pt_theory(do, N, C)
 fo.v2pt_theory(ce, N, E)
 eo.v2pt_theory(fo, N, E)
 
 # wheel contact velocities
-dn.set_vel(N, 0.0 * N['1'])
+dn.v2pt_theory(do, N, D)
 fn.v2pt_theory(fo, N, F)
 
 ####################
@@ -416,41 +423,41 @@ substitutions.update(dynamic_substitutions)
 print('Substituting numerical parameters into SymPy expressions.')
 num_mass_matrix = sm.matrix2numpy(mec.msubs(mass_matrix, substitutions),
                                   dtype=float)
-num_forcing_vector = sm.matrix2numpy(mec.msubs(forcing_vector,
-                                               substitutions), dtype=float)
+num_forcing_vector = sm.matrix2numpy(mec.msubs(forcing_vector, substitutions),
+                                     dtype=float)
 xd_from_sub = np.linalg.solve(num_mass_matrix, num_forcing_vector).flatten()
 
 print('The state derivatives from substitution:')
 print(xd_from_sub)
 
-# BUGS to report:
-# 1. find_dynamicsymbols should deal with Vectors and lists of
-# exprs/vectors/etc.
-
-print('Generating a right hand side function.')
-
-rhs_of_kin_diffs = sm.Matrix([kane.kindiffdict()[k] for k in kane.q.diff(t)])
-
-g = CythonODEFunctionGenerator(forcing_vector,
-                               kane.q[:],
-                               kane.u[:],
-                               list(constant_substitutions.keys()),
-                               mass_matrix=mass_matrix,
-                               coordinate_derivatives=rhs_of_kin_diffs,
-                               specifieds=[T4, T6, T7],
-                               constants_arg_type='array',
-                               specifieds_arg_type='array')
-print('Generating rhs')
-rhs = g.generate()
-
-state_vals = np.array([dynamic_substitutions[x] for x in kane.q[:] +
-                       kane.u[:]])
-specified_vals = np.zeros(3)
-constants_vals = np.array(list(constant_substitutions.values()))
-
-xd_from_gen = rhs(state_vals, 0.0, specified_vals, constants_vals)
-print('The state derivatives from code gen:')
-print(xd_from_gen)
+## BUGS to report:
+## 1. find_dynamicsymbols should deal with Vectors and lists of
+## exprs/vectors/etc.
+#
+#print('Generating a right hand side function.')
+#
+#rhs_of_kin_diffs = sm.Matrix([kane.kindiffdict()[k] for k in kane.q.diff(t)])
+#
+#g = CythonODEFunctionGenerator(forcing_vector,
+#                               kane.q[:],
+#                               kane.u[:],
+#                               list(constant_substitutions.keys()),
+#                               mass_matrix=mass_matrix,
+#                               coordinate_derivatives=rhs_of_kin_diffs,
+#                               specifieds=[T4, T6, T7],
+#                               constants_arg_type='array',
+#                               specifieds_arg_type='array')
+#print('Generating rhs')
+#rhs = g.generate()
+#
+#state_vals = np.array([dynamic_substitutions[x] for x in kane.q[:] +
+#                       kane.u[:]])
+#specified_vals = np.zeros(3)
+#constants_vals = np.array(list(constant_substitutions.values()))
+#
+#xd_from_gen = rhs(state_vals, 0.0, specified_vals, constants_vals)
+#print('The state derivatives from code gen:')
+#print(xd_from_gen)
 
 print("Generating output dictionary.")
 # convert the outputs from my model to the Basu-Mandal coordinates
@@ -460,13 +467,11 @@ speed_deriv_names = [str(speed)[:-3] + 'p' for speed in kane.u[:]]
 
 moore_output_from_sub = {k: v for k, v in zip(speed_deriv_names,
                                               list(xd_from_sub))}
-moore_output_from_gen = {k: v for k, v in zip(speed_deriv_names,
-    list(xd_from_gen)[g.num_coordinates:])}
+#moore_output_from_gen = {k: v for k, v in zip(speed_deriv_names,
+#        list(xd_from_gen)[g.num_coordinates:])}
 
 # compute u1' and u2' manually
-u1 = -rr * u6 * sm.cos(q3)
 u1p = u1.diff(t)
-u2 = -rr * u6 * sm.sin(q3)
 u2p = u2.diff(t)
 
 moore_output_from_sub['u1p'] = u1p.subs(
@@ -476,33 +481,40 @@ moore_output_from_sub['u2p'] = u2p.subs(
         {u6.diff(t): moore_output_from_sub['u6p']}).subs(
                 kane.kindiffdict()).subs(substitutions)
 
-moore_output_from_gen['u1p'] = u1p.subs(
-        {u6.diff(t): moore_output_from_gen['u6p']}).subs(
-                kane.kindiffdict()).subs(substitutions)
-moore_output_from_gen['u2p'] = u2p.subs(
-        {u6.diff(t): moore_output_from_gen['u6p']}).subs(
-                kane.kindiffdict()).subs(substitutions)
+#moore_output_from_gen['u1p'] = u1p.subs(
+#        {u6.diff(t): moore_output_from_gen['u6p']}).subs(
+#                kane.kindiffdict()).subs(substitutions)
+#moore_output_from_gen['u2p'] = u2p.subs(
+#        {u6.diff(t): moore_output_from_gen['u6p']}).subs(
+#                kane.kindiffdict()).subs(substitutions)
 
 moore_output_from_sub.update(moore_input)
-moore_output_from_gen.update(moore_input)
+#moore_output_from_gen.update(moore_input)
 
 moore_output_basu_from_sub = bicycle.moore_to_basu(moore_output_from_sub,
                                                    bp['rR'], bp['lam'])
-moore_output_basu_from_gen = bicycle.moore_to_basu(moore_output_from_gen,
-                                                   bp['rR'], bp['lam'])
+#moore_output_basu_from_gen = bicycle.moore_to_basu(moore_output_from_gen,
+#                                                   bp['rR'], bp['lam'])
 
 basu_output = bicycle.basu_table_one_output()
+basu_output.update(bicycle.basu_table_one_input())
 
 print("Assertions.")
 
 for k, bv in basu_output.items():
-    for result in [moore_output_basu_from_sub, moore_output_basu_from_gen]:
+    #for result in [moore_output_basu_from_sub, moore_output_basu_from_gen]:
+    for result in [moore_output_basu_from_sub]:
         try:
             mv = float(result[k])
         except KeyError:
             print('{} was not checked.'.format(k))
         else:
             try:
-                testing.assert_allclose(bv, mv)
+                if bv == 0. or mv == 0.:
+                    testing.assert_allclose(bv, mv, atol=1e-11, rtol=0)
+                else:
+                    testing.assert_allclose(bv, mv)
             except AssertionError:
-                print('Failed: {}:\n  Correct: {:1.16f}\nIncorrect: {:1.16f}'.format(k, bv, mv))
+                msg = 'Failed: {}:\n basu-mandal: {:1.16f}\n  moore(sub): {:1.16f}'
+                print(msg.format(k, bv, mv))
+                print('  difference: {}'.format(bv - mv))
